@@ -15,7 +15,7 @@ import logging
 import os
 from typing import Any, Callable, cast, Dict, Optional
 
-# Try to import OpenTelemetry core components - make them truly optional
+# Third-Party - Try to import OpenTelemetry core components - make them truly optional
 OTEL_AVAILABLE = False
 try:
     # Third-Party
@@ -92,6 +92,9 @@ except ImportError:
     except Exception as exc:  # nosec B110 - best-effort optional shim
         # Shimming is a non-critical, best-effort step for tests; log and continue.
         logging.getLogger(__name__).debug("Skipping OpenTelemetry shim setup: %s", exc)
+
+# First-Party
+from mcpgateway.utils.correlation_id import get_correlation_id  # noqa: E402  # pylint: disable=wrong-import-position
 
 # Try to import optional exporters
 try:
@@ -201,6 +204,53 @@ def init_telemetry() -> Optional[Any]:
         # Register provider if trace API is present
         if trace is not None and hasattr(trace, "set_tracer_provider"):
             cast(Any, trace).set_tracer_provider(provider)
+
+        # Create a custom span processor to copy resource attributes to span attributes
+        # This is needed because Arize requires arize.project.name as a span attribute
+        class ResourceAttributeSpanProcessor:
+            """Span processor that copies specific resource attributes to span attributes."""
+
+            def __init__(self, attributes_to_copy=None):
+                self.attributes_to_copy = attributes_to_copy or ["arize.project.name", "model_id"]
+                logger.info(f"ResourceAttributeSpanProcessor will copy: {self.attributes_to_copy}")
+
+            def on_start(self, span, _parent_context=None):
+                """Copy specified resource attributes to span attributes when span starts.
+
+                Args:
+                    span: The span being started.
+                    _parent_context: The parent context (unused, required by interface).
+                """
+                if not hasattr(span, "resource") or span.resource is None:
+                    return
+
+                # Get resource attributes
+                resource_attributes = getattr(span.resource, "attributes", {})
+
+                # Copy specified attributes from resource to span
+                for attr in self.attributes_to_copy:
+                    if attr in resource_attributes:
+                        value = resource_attributes[attr]
+                        span.set_attribute(attr, value)
+                        logger.debug(f"Copied resource attribute to span: {attr}={value}")
+
+            def on_end(self, span):
+                """Handle span end event.
+
+                Required by the SpanProcessor interface but not used.
+
+                Args:
+                    span: The span being ended.
+                """
+                pass  # pylint: disable=unnecessary-pass
+
+        # Add the custom span processor to copy resource attributes to spans
+        # This is needed for Arize which requires certain attributes as span attributes
+        # Enable via OTEL_COPY_RESOURCE_ATTRS_TO_SPANS=true (disabled by default)
+        copy_resource_attrs = os.getenv("OTEL_COPY_RESOURCE_ATTRS_TO_SPANS", "false").lower() == "true"
+        if resource is not None and copy_resource_attrs:
+            logger.info("Adding ResourceAttributeSpanProcessor to copy resource attributes to spans")
+            provider.add_span_processor(ResourceAttributeSpanProcessor())
 
         # Configure the appropriate exporter based on type
         exporter: Optional[Any] = None
@@ -392,6 +442,21 @@ def create_span(name: str, attributes: Optional[Dict[str, Any]] = None) -> Any:
     if not _TRACER:
         # Return a no-op context manager if tracing is not configured or available
         return nullcontext()
+
+    # Auto-inject correlation ID into all spans for request tracing
+    try:
+        correlation_id = get_correlation_id()
+        if correlation_id:
+            if attributes is None:
+                attributes = {}
+            # Add correlation ID if not already present
+            if "correlation_id" not in attributes:
+                attributes["correlation_id"] = correlation_id
+            if "request_id" not in attributes:
+                attributes["request_id"] = correlation_id  # Alias for compatibility
+    except Exception as exc:
+        # Correlation ID not available or error getting it, continue without it
+        logger.debug("Failed to add correlation_id to span: %s", exc)
 
     # Start span and return the context manager
     span_context = _TRACER.start_as_current_span(name)

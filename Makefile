@@ -183,6 +183,8 @@ check-env-dev:
 # help: ▶️ SERVE
 # help: serve                - Run production Gunicorn server on :4444
 # help: certs                - Generate self-signed TLS cert & key in ./certs (won't overwrite)
+# help: certs-passphrase     - Generate self-signed cert with passphrase-protected key
+# help: certs-remove-passphrase - Remove passphrase from encrypted key
 # help: certs-jwt            - Generate JWT RSA keys in ./certs/jwt/ (idempotent)
 # help: certs-jwt-ecdsa      - Generate JWT ECDSA keys in ./certs/jwt/ (idempotent)
 # help: certs-all            - Generate both TLS certs and JWT keys (combo target)
@@ -224,6 +226,45 @@ certs:                           ## Generate ./certs/cert.pem & ./certs/key.pem 
 		echo "✅  TLS certificate written to ./certs"; \
 	fi
 	chmod 640 certs/key.pem
+
+certs-passphrase:                ## Generate self-signed cert with passphrase-protected key
+	@if [ -f certs/cert.pem ] && [ -f certs/key-encrypted.pem ]; then \
+		echo "🔏  Existing passphrase-protected certificates found - skipping."; \
+	else \
+		echo "🔏  Generating passphrase-protected certificate (1 year)..."; \
+		mkdir -p certs; \
+		read -sp "Enter passphrase for private key: " PASSPHRASE; echo; \
+		read -sp "Confirm passphrase: " PASSPHRASE2; echo; \
+		if [ "$$PASSPHRASE" != "$$PASSPHRASE2" ]; then \
+			echo "❌  Passphrases do not match!"; \
+			exit 1; \
+		fi; \
+		openssl req -x509 -newkey rsa:4096 -sha256 -days 365 \
+			-keyout certs/key-encrypted.pem -out certs/cert.pem \
+			-subj "/CN=localhost" \
+			-addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+			-passout pass:"$$PASSPHRASE"; \
+		echo "✅  Passphrase-protected certificate created"; \
+		echo "📁  Certificate: ./certs/cert.pem"; \
+		echo "📁  Encrypted Key: ./certs/key-encrypted.pem"; \
+		echo ""; \
+		echo "💡  To use this certificate:"; \
+		echo "   1. Set KEY_FILE_PASSWORD environment variable"; \
+		echo "   2. Run: KEY_FILE_PASSWORD='your-passphrase' SSL=true CERT_FILE=certs/cert.pem KEY_FILE=certs/key-encrypted.pem make serve-ssl"; \
+	fi
+	@chmod 600 certs/key-encrypted.pem
+
+certs-remove-passphrase:         ## Remove passphrase from encrypted key (creates key.pem from key-encrypted.pem)
+	@if [ ! -f certs/key-encrypted.pem ]; then \
+		echo "❌  No encrypted key found at certs/key-encrypted.pem"; \
+		echo "💡  Generate one with: make certs-passphrase"; \
+		exit 1; \
+	fi
+	@echo "🔓  Removing passphrase from private key..."
+	@openssl rsa -in certs/key-encrypted.pem -out certs/key.pem
+	@chmod 600 certs/key.pem
+	@echo "✅  Passphrase removed - unencrypted key saved to certs/key.pem"
+	@echo "⚠️   Keep this file secure! It contains your unencrypted private key."
 
 certs-jwt:                       ## Generate JWT RSA keys in ./certs/jwt/ (idempotent)
 	@if [ -f certs/jwt/private.pem ] && [ -f certs/jwt/public.pem ]; then \
@@ -432,7 +473,7 @@ clean:
 ## --- Automated checks --------------------------------------------------------
 smoketest:
 	@echo "🚀 Running smoketest..."
-	@bash -c '\
+	@/bin/bash -c 'source $(VENV_DIR)/bin/activate && \
 		./smoketest.py --verbose || { echo "❌ Smoketest failed!"; exit 1; }; \
 		echo "✅ Smoketest passed!" \
 	'
@@ -443,7 +484,7 @@ test:
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		export DATABASE_URL='sqlite:///:memory:' && \
 		export TEST_DATABASE_URL='sqlite:///:memory:' && \
-		uv run pytest -n auto --maxfail=0 -v --ignore=tests/fuzz"
+		uv run --active pytest -n auto --maxfail=0 -v --ignore=tests/fuzz"
 
 test-profile:
 	@echo "🧪 Running tests with profiling (showing slowest tests)..."
@@ -451,7 +492,7 @@ test-profile:
 	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
 		export DATABASE_URL='sqlite:///:memory:' && \
 		export TEST_DATABASE_URL='sqlite:///:memory:' && \
-		uv run pytest -n auto --durations=20 --durations-min=1.0 --disable-warnings -v --ignore=tests/fuzz"
+		uv run --active pytest -n auto --durations=20 --durations-min=1.0 --disable-warnings -v --ignore=tests/fuzz"
 
 coverage:
 	@test -d "$(VENV_DIR)" || $(MAKE) venv
@@ -1027,7 +1068,9 @@ flake8:                             ## 🐍  flake8 checks
 
 pylint: uv                             ## 🐛  pylint checks
 	@echo "🐛 pylint $(TARGET) (parallel)..."
-	uv run pylint -j 0 --fail-on E --fail-under 10 $(TARGET)
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		uv run --active pylint -j 0 --fail-on E --fail-under 10 $(TARGET)"
 
 markdownlint:					    ## 📖  Markdown linting
 	@# Install markdownlint-cli2 if not present
@@ -1073,7 +1116,9 @@ pycodestyle:                        ## 📝  Simple PEP-8 checker
 
 pre-commit: uv                      ## 🪄  Run pre-commit tool
 	@echo "🪄  Running pre-commit hooks..."
-	uv run pre-commit run --config .pre-commit-lite.yaml --all-files --show-diff-on-failure
+	@test -d "$(VENV_DIR)" || $(MAKE) venv
+	@/bin/bash -c "source $(VENV_DIR)/bin/activate && \
+		uv run --active pre-commit run --config .pre-commit-lite.yaml --all-files --show-diff-on-failure"
 
 ruff:                               ## ⚡  Ruff lint + (eventually) format
 	@echo "⚡ ruff $(TARGET)..." && $(VENV_DIR)/bin/ruff check $(TARGET)
@@ -2098,7 +2143,7 @@ endif
 # =============================================================================
 
 # Auto-detect container runtime if not specified - DEFAULT TO DOCKER
-CONTAINER_RUNTIME = $(shell command -v docker >/dev/null 2>&1 && echo docker || echo podman)
+CONTAINER_RUNTIME ?= $(shell command -v docker >/dev/null 2>&1 && echo docker || echo podman)
 
 # Alternative: Always default to docker unless explicitly overridden
 # CONTAINER_RUNTIME ?= docker
@@ -2147,6 +2192,8 @@ endef
 # =============================================================================
 # help: 🐳 UNIFIED CONTAINER OPERATIONS (Auto-detects Docker/Podman)
 # help: container-build      - Build image using detected runtime
+# help: container-build-multi - Build multiplatform image (amd64/arm64/s390x) locally
+# help: container-inspect-manifest - Inspect multiplatform manifest in registry
 # help: container-build-rust - Build image WITH Rust plugins (ENABLE_RUST_BUILD=1)
 # help: container-build-rust-lite - Build lite image WITH Rust plugins
 # help: container-rust       - Build with Rust and run container (all-in-one)
@@ -2172,7 +2219,7 @@ endef
         container-run container-run-ssl container-run-ssl-host \
         container-run-ssl-jwt container-push container-info container-stop container-logs container-shell \
         container-health image-list image-clean image-retag container-check-image \
-        container-build-multi use-docker use-podman show-runtime print-runtime \
+        container-build-multi container-inspect-manifest use-docker use-podman show-runtime print-runtime \
         print-image container-validate-env container-check-ports container-wait-healthy
 
 
@@ -2402,28 +2449,54 @@ container-health:
 	@$(CONTAINER_RUNTIME) inspect $(PROJECT_NAME) --format='{{range .State.Health.Log}}{{.Output}}{{end}}' 2>/dev/null || true
 
 container-build-multi:
-	@echo "🔨 Building multi-architecture image..."
+	@echo "🔨 Building multi-architecture image (amd64, arm64, s390x)..."
+	@echo "💡 Note: Multiplatform images require a registry. Use REGISTRY= to push, or omit to validate only."
 	@if [ "$(CONTAINER_RUNTIME)" = "docker" ]; then \
 		if ! docker buildx inspect $(PROJECT_NAME)-builder >/dev/null 2>&1; then \
-			echo "📦 Creating buildx builder..."; \
-			docker buildx create --name $(PROJECT_NAME)-builder; \
+			echo "📦 Creating buildx builder with docker-container driver..."; \
+			docker buildx create --name $(PROJECT_NAME)-builder --driver docker-container; \
 		fi; \
 		docker buildx use $(PROJECT_NAME)-builder; \
-		docker buildx build \
-			--platform=linux/amd64,linux/arm64,linux/s390x \
-			-f $(CONTAINER_FILE) \
-			--tag $(IMAGE_BASE):$(IMAGE_TAG) \
-			--push \
-			.; \
+		if [ -n "$(REGISTRY)" ]; then \
+			docker buildx build \
+				--platform=linux/amd64,linux/arm64,linux/s390x \
+				-f $(CONTAINER_FILE) \
+				--tag $(REGISTRY)/$(IMAGE_BASE):$(IMAGE_TAG) \
+				--push \
+				.; \
+			echo "✅ Multiplatform image pushed to $(REGISTRY)/$(IMAGE_BASE):$(IMAGE_TAG)"; \
+		else \
+			docker buildx build \
+				--platform=linux/amd64,linux/arm64,linux/s390x \
+				-f $(CONTAINER_FILE) \
+				--tag $(IMAGE_BASE):$(IMAGE_TAG) \
+				.; \
+			echo "✅ Multiplatform build validated (no push - set REGISTRY= to push)"; \
+		fi; \
 	elif [ "$(CONTAINER_RUNTIME)" = "podman" ]; then \
 		echo "📦 Building manifest with Podman..."; \
 		$(CONTAINER_RUNTIME) build --platform=linux/amd64,linux/arm64,linux/s390x \
 			-f $(CONTAINER_FILE) \
 			--manifest $(IMAGE_BASE):$(IMAGE_TAG) \
 			.; \
-		echo "💡 To push: podman manifest push $(IMAGE_BASE):$(IMAGE_TAG)"; \
+		echo "✅ Multiplatform manifest built: $(IMAGE_BASE):$(IMAGE_TAG)"; \
 	else \
 		echo "❌ Multi-arch builds require Docker buildx or Podman"; \
+		exit 1; \
+	fi
+
+# Inspect multiplatform manifest in a registry
+container-inspect-manifest:
+	@echo "🔍 Inspecting multiplatform manifest..."
+	@if [ -z "$(REGISTRY)" ]; then \
+		echo "Usage: make container-inspect-manifest REGISTRY=ghcr.io/org/repo:tag"; \
+		echo "Example: make container-inspect-manifest REGISTRY=ghcr.io/ibm/mcp-context-forge:latest"; \
+	elif [ "$(CONTAINER_RUNTIME)" = "docker" ]; then \
+		docker buildx imagetools inspect $(REGISTRY); \
+	elif [ "$(CONTAINER_RUNTIME)" = "podman" ]; then \
+		$(CONTAINER_RUNTIME) manifest inspect $(REGISTRY); \
+	else \
+		echo "❌ Manifest inspection requires Docker buildx or Podman"; \
 		exit 1; \
 	fi
 

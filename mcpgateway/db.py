@@ -29,7 +29,8 @@ import uuid
 
 # Third-Party
 import jsonschema
-from sqlalchemy import Boolean, Column, create_engine, DateTime, event, Float, ForeignKey, func, Index, Integer, JSON, make_url, select, String, Table, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, create_engine, DateTime, event, Float, ForeignKey, func, Index, Integer, JSON, make_url, MetaData, select, String, Table, Text, UniqueConstraint, VARCHAR
+from sqlalchemy.engine import Engine
 from sqlalchemy.event import listen
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.hybrid import hybrid_property
@@ -89,30 +90,57 @@ elif backend == "sqlite":
 # ---------------------------------------------------------------------------
 # 5. Build the Engine with a single, clean connect_args mapping.
 # ---------------------------------------------------------------------------
-if backend == "sqlite":
-    # SQLite supports connection pooling with proper configuration
-    # For SQLite, we use a smaller pool size since it's file-based
-    sqlite_pool_size = min(settings.db_pool_size, 50)  # Cap at 50 for SQLite
-    sqlite_max_overflow = min(settings.db_max_overflow, 20)  # Cap at 20 for SQLite
 
-    logger.info("Configuring SQLite with pool_size=%s, max_overflow=%s", sqlite_pool_size, sqlite_max_overflow)
 
-    engine = create_engine(
-        settings.database_url,
-        pool_pre_ping=True,  # quick liveness check per checkout
-        pool_size=sqlite_pool_size,
-        max_overflow=sqlite_max_overflow,
-        pool_timeout=settings.db_pool_timeout,
-        pool_recycle=settings.db_pool_recycle,
-        # SQLite specific optimizations
-        poolclass=QueuePool,  # Explicit pool class
-        connect_args=connect_args,
-        # Log pool events in debug mode
-        echo_pool=settings.log_level == "DEBUG",
-    )
-else:
+def build_engine() -> Engine:
+    """Build the SQLAlchemy engine with appropriate settings.
+
+    This function constructs the SQLAlchemy engine using the database URL
+    and connection arguments determined by the backend type. It also configures
+    the connection pool size and timeout based on application settings.
+
+    Returns:
+        SQLAlchemy Engine instance configured for the specified database.
+    """
+    if backend == "sqlite":
+        # SQLite supports connection pooling with proper configuration
+        # For SQLite, we use a smaller pool size since it's file-based
+        sqlite_pool_size = min(settings.db_pool_size, 50)  # Cap at 50 for SQLite
+        sqlite_max_overflow = min(settings.db_max_overflow, 20)  # Cap at 20 for SQLite
+
+        logger.info("Configuring SQLite with pool_size=%s, max_overflow=%s", sqlite_pool_size, sqlite_max_overflow)
+
+        return create_engine(
+            settings.database_url,
+            pool_pre_ping=True,  # quick liveness check per checkout
+            pool_size=sqlite_pool_size,
+            max_overflow=sqlite_max_overflow,
+            pool_timeout=settings.db_pool_timeout,
+            pool_recycle=settings.db_pool_recycle,
+            # SQLite specific optimizations
+            poolclass=QueuePool,  # Explicit pool class
+            connect_args=connect_args,
+            # Log pool events in debug mode
+            echo_pool=settings.log_level == "DEBUG",
+        )
+
+    if backend in ("mysql", "mariadb"):
+        # MariaDB/MySQL specific configuration
+        logger.info("Configuring MariaDB/MySQL with pool_size=%s, max_overflow=%s", settings.db_pool_size, settings.db_max_overflow)
+
+        return create_engine(
+            settings.database_url,
+            pool_pre_ping=True,
+            pool_size=settings.db_pool_size,
+            max_overflow=settings.db_max_overflow,
+            pool_timeout=settings.db_pool_timeout,
+            pool_recycle=settings.db_pool_recycle,
+            connect_args=connect_args,
+            isolation_level="READ_COMMITTED",  # Fix PyMySQL sync issues
+        )
+
     # Other databases support full pooling configuration
-    engine = create_engine(
+    return create_engine(
         settings.database_url,
         pool_pre_ping=True,  # quick liveness check per checkout
         pool_size=settings.db_pool_size,
@@ -121,6 +149,9 @@ else:
         pool_recycle=settings.db_pool_recycle,
         connect_args=connect_args,
     )
+
+
+engine = build_engine()
 
 # Initialize SQLAlchemy instrumentation for observability
 if settings.observability_enabled:
@@ -190,37 +221,60 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def refresh_slugs_on_startup():
     """Refresh slugs for all gateways and names of tools on startup."""
+    try:
+        with cast(Any, SessionLocal)() as session:
+            # Skip if tables don't exist yet (fresh database)
+            try:
+                gateways = session.query(Gateway).all()
+            except Exception:
+                logger.info("Gateway table not found, skipping slug refresh")
+                return
 
-    with cast(Any, SessionLocal)() as session:
-        gateways = session.query(Gateway).all()
-        updated = False
-        for gateway in gateways:
-            new_slug = slugify(gateway.name)
-            if gateway.slug != new_slug:
-                gateway.slug = new_slug
-                updated = True
-        if updated:
-            session.commit()
+            updated = False
+            for gateway in gateways:
+                new_slug = slugify(gateway.name)
+                if gateway.slug != new_slug:
+                    gateway.slug = new_slug
+                    updated = True
+            if updated:
+                session.commit()
 
-        tools = session.query(Tool).all()
-        for tool in tools:
-            session.expire(tool, ["gateway"])
+            try:
+                tools = session.query(Tool).all()
+                for tool in tools:
+                    session.expire(tool, ["gateway"])
 
-        updated = False
-        for tool in tools:
-            if tool.gateway:
-                new_name = f"{tool.gateway.slug}{settings.gateway_tool_name_separator}{slugify(tool.original_name)}"
-            else:
-                new_name = slugify(tool.original_name)
-            if tool.name != new_name:
-                tool.name = new_name
-                updated = True
-        if updated:
-            session.commit()
+                updated = False
+                for tool in tools:
+                    if tool.gateway:
+                        new_name = f"{tool.gateway.slug}{settings.gateway_tool_name_separator}{slugify(tool.original_name)}"
+                    else:
+                        new_name = slugify(tool.original_name)
+                    if tool.name != new_name:
+                        tool.name = new_name
+                        updated = True
+                if updated:
+                    session.commit()
+            except Exception:
+                logger.info("Tool table not found, skipping tool name refresh")
+
+    except Exception as e:
+        logger.warning("Failed to refresh slugs on startup: %s", e)
 
 
 class Base(DeclarativeBase):
     """Base class for all models."""
+
+    # MariaDB-compatible naming convention for foreign keys
+    metadata = MetaData(
+        naming_convention={
+            "fk": "fk_%(table_name)s_%(column_0_name)s",
+            "pk": "pk_%(table_name)s",
+            "ix": "ix_%(table_name)s_%(column_0_name)s",
+            "uq": "uq_%(table_name)s_%(column_0_name)s",
+            "ck": "ck_%(table_name)s_%(constraint_name)s",
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +536,7 @@ class EmailUser(Base):
     password_hash_type: Mapped[str] = mapped_column(String(20), default="argon2id", nullable=False)
     failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    password_change_required: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
@@ -1373,7 +1428,7 @@ server_resource_association = Table(
     "server_resource_association",
     Base.metadata,
     Column("server_id", String(36), ForeignKey("servers.id"), primary_key=True),
-    Column("resource_id", Integer, ForeignKey("resources.id"), primary_key=True),
+    Column("resource_id", String(36), ForeignKey("resources.id"), primary_key=True),
 )
 
 # Association table for servers and prompts
@@ -1381,7 +1436,7 @@ server_prompt_association = Table(
     "server_prompt_association",
     Base.metadata,
     Column("server_id", String(36), ForeignKey("servers.id"), primary_key=True),
-    Column("prompt_id", Integer, ForeignKey("prompts.id"), primary_key=True),
+    Column("prompt_id", String(36), ForeignKey("prompts.id"), primary_key=True),
 )
 
 # Association table for servers and A2A agents
@@ -1441,7 +1496,7 @@ class ResourceMetric(Base):
 
     Attributes:
         id (int): Primary key.
-        resource_id (int): Foreign key linking to the resource.
+        resource_id (str): Foreign key linking to the resource.
         timestamp (datetime): The time when the invocation occurred.
         response_time (float): The response time in seconds.
         is_success (bool): True if the invocation succeeded, False otherwise.
@@ -1451,7 +1506,7 @@ class ResourceMetric(Base):
     __tablename__ = "resource_metrics"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    resource_id: Mapped[int] = mapped_column(Integer, ForeignKey("resources.id"), nullable=False)
+    resource_id: Mapped[str] = mapped_column(String(36), ForeignKey("resources.id"), nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     response_time: Mapped[float] = mapped_column(Float, nullable=False)
     is_success: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -1493,7 +1548,7 @@ class PromptMetric(Base):
 
     Attributes:
         id (int): Primary key.
-        prompt_id (int): Foreign key linking to the prompt.
+        prompt_id (str): Foreign key linking to the prompt.
         timestamp (datetime): The time when the invocation occurred.
         response_time (float): The response time in seconds.
         is_success (bool): True if the invocation succeeded, False otherwise.
@@ -1503,7 +1558,7 @@ class PromptMetric(Base):
     __tablename__ = "prompt_metrics"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    prompt_id: Mapped[int] = mapped_column(Integer, ForeignKey("prompts.id"), nullable=False)
+    prompt_id: Mapped[str] = mapped_column(String(36), ForeignKey("prompts.id"), nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     response_time: Mapped[float] = mapped_column(Float, nullable=False)
     is_success: Mapped[bool] = mapped_column(Boolean, nullable=False)
@@ -2155,16 +2210,17 @@ class Resource(Base):
 
     __tablename__ = "resources"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
     uri: Mapped[str] = mapped_column(String(767), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     mime_type: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    template: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # URI template for parameterized resources
+    uri_template: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # URI template for parameterized resources
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
-    is_active: Mapped[bool] = mapped_column(default=True)
+    # is_active: Mapped[bool] = mapped_column(default=True)
+    enabled: Mapped[bool] = mapped_column(default=True)
     tags: Mapped[List[str]] = mapped_column(JSON, default=list, nullable=False)
 
     # Comprehensive metadata for audit tracking
@@ -2368,12 +2424,30 @@ class ResourceSubscription(Base):
     __tablename__ = "resource_subscriptions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    resource_id: Mapped[int] = mapped_column(ForeignKey("resources.id"))
+    resource_id: Mapped[str] = mapped_column(ForeignKey("resources.id"))
     subscriber_id: Mapped[str] = mapped_column(String(255), nullable=False)  # Client identifier
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     last_notification: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     resource: Mapped["Resource"] = relationship(back_populates="subscriptions")
+
+
+class ToolOpsTestCases(Base):
+    """
+    ORM model for a registered Tool test cases.
+
+    Represents a tool and the generated test cases.
+    Includes:
+        - tool_id: unique tool identifier
+        - test_cases: generated test cases.
+        - run_status: status of test case generation
+    """
+
+    __tablename__ = "toolops_test_cases"
+
+    tool_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    test_cases: Mapped[Dict[str, Any]] = mapped_column(JSON)
+    run_status: Mapped[str] = mapped_column(String(255), nullable=False)
 
 
 class Prompt(Base):
@@ -2396,14 +2470,15 @@ class Prompt(Base):
 
     __tablename__ = "prompts"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     template: Mapped[str] = mapped_column(Text)
     argument_schema: Mapped[Dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
-    is_active: Mapped[bool] = mapped_column(default=True)
+    # is_active: Mapped[bool] = mapped_column(default=True)
+    enabled: Mapped[bool] = mapped_column(default=True)
     tags: Mapped[List[str]] = mapped_column(JSON, default=list, nullable=False)
 
     # Comprehensive metadata for audit tracking
@@ -2594,7 +2669,8 @@ class Server(Base):
     icon: Mapped[Optional[str]] = mapped_column(String(767), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
-    is_active: Mapped[bool] = mapped_column(default=True)
+    # is_active: Mapped[bool] = mapped_column(default=True)
+    enabled: Mapped[bool] = mapped_column(default=True)
     tags: Mapped[List[str]] = mapped_column(JSON, default=list, nullable=False)
 
     # Comprehensive metadata for audit tracking
@@ -3684,6 +3760,25 @@ def get_db() -> Generator[Session, Any, None]:
         db.close()
 
 
+def patch_string_columns_for_mariadb(base, engine_) -> None:
+    """
+    MariaDB requires VARCHAR to have an explicit length.
+    Auto-assign VARCHAR(255) to any String() columns without a length.
+
+    Args:
+        base (DeclarativeBase): SQLAlchemy Declarative Base containing metadata.
+        engine_ (Engine): SQLAlchemy engine, used to detect MariaDB dialect.
+    """
+    if engine_.dialect.name != "mariadb":
+        return
+
+    for table in base.metadata.tables.values():
+        for column in table.columns:
+            if isinstance(column.type, String) and column.type.length is None:
+                # Replace with VARCHAR(255)
+                column.type = VARCHAR(255)
+
+
 # Create all tables
 def init_db():
     """
@@ -3693,10 +3788,259 @@ def init_db():
         Exception: If database initialization fails.
     """
     try:
+        # Apply MariaDB compatibility fix
+        patch_string_columns_for_mariadb(Base, engine)
+
         # Base.metadata.drop_all(bind=engine)
         Base.metadata.create_all(bind=engine)
     except SQLAlchemyError as e:
         raise Exception(f"Failed to initialize database: {str(e)}")
+
+
+# ============================================================================
+# Structured Logging Models
+# ============================================================================
+
+
+class StructuredLogEntry(Base):
+    """Structured log entry for comprehensive logging and analysis.
+
+    Stores all log entries with correlation IDs, performance metrics,
+    and security context for advanced search and analytics.
+    """
+
+    __tablename__ = "structured_log_entries"
+
+    # Primary key
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+
+    # Timestamps
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True, default=utc_now)
+
+    # Correlation and request tracking
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    request_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+
+    # Log metadata
+    level: Mapped[str] = mapped_column(String(20), nullable=False, index=True)  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    component: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    logger: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # User and request context
+    user_id: Mapped[Optional[str]] = mapped_column(String(255), index=True, nullable=True)
+    user_email: Mapped[Optional[str]] = mapped_column(String(255), index=True, nullable=True)
+    client_ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)  # IPv6 max length
+    user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    request_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    request_method: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+
+    # Performance data
+    duration_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    operation_type: Mapped[Optional[str]] = mapped_column(String(100), index=True, nullable=True)
+
+    # Security context
+    is_security_event: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
+    security_severity: Mapped[Optional[str]] = mapped_column(String(20), index=True, nullable=True)  # LOW, MEDIUM, HIGH, CRITICAL
+    threat_indicators: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+
+    # Structured context data
+    context: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    error_details: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    performance_metrics: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+
+    # System information
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
+    process_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    thread_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    version: Mapped[str] = mapped_column(String(50), nullable=False)
+    environment: Mapped[str] = mapped_column(String(50), nullable=False, default="production")
+
+    # OpenTelemetry trace context
+    trace_id: Mapped[Optional[str]] = mapped_column(String(32), index=True, nullable=True)
+    span_id: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+
+    # Indexes for performance
+    __table_args__ = (
+        Index("idx_log_correlation_time", "correlation_id", "timestamp"),
+        Index("idx_log_user_time", "user_id", "timestamp"),
+        Index("idx_log_level_time", "level", "timestamp"),
+        Index("idx_log_component_time", "component", "timestamp"),
+        Index("idx_log_security", "is_security_event", "security_severity", "timestamp"),
+        Index("idx_log_operation", "operation_type", "timestamp"),
+        Index("idx_log_trace", "trace_id", "timestamp"),
+    )
+
+
+class PerformanceMetric(Base):
+    """Aggregated performance metrics from log analysis.
+
+    Stores time-windowed aggregations of operation performance
+    for analytics and trend analysis.
+    """
+
+    __tablename__ = "performance_metrics"
+
+    # Primary key
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+
+    # Timestamp
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True, default=utc_now)
+
+    # Metric identification
+    operation_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    component: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+
+    # Aggregated metrics
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+    # Duration metrics (in milliseconds)
+    avg_duration_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    min_duration_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    max_duration_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    p50_duration_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    p95_duration_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    p99_duration_ms: Mapped[float] = mapped_column(Float, nullable=False)
+
+    # Time window
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # Additional context
+    metric_metadata: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("idx_perf_operation_time", "operation_type", "window_start"),
+        Index("idx_perf_component_time", "component", "window_start"),
+        Index("idx_perf_window", "window_start", "window_end"),
+    )
+
+
+class SecurityEvent(Base):
+    """Security event logging for threat detection and audit trails.
+
+    Specialized table for security events with enhanced context
+    and threat analysis capabilities.
+    """
+
+    __tablename__ = "security_events"
+
+    # Primary key
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+
+    # Timestamps
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True, default=utc_now)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+    # Correlation tracking
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    log_entry_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("structured_log_entries.id"), index=True, nullable=True)
+
+    # Event classification
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # auth_failure, suspicious_activity, rate_limit, etc.
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, index=True)  # LOW, MEDIUM, HIGH, CRITICAL
+    category: Mapped[str] = mapped_column(String(50), nullable=False, index=True)  # authentication, authorization, data_access, etc.
+
+    # User and request context
+    user_id: Mapped[Optional[str]] = mapped_column(String(255), index=True, nullable=True)
+    user_email: Mapped[Optional[str]] = mapped_column(String(255), index=True, nullable=True)
+    client_ip: Mapped[str] = mapped_column(String(45), nullable=False, index=True)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Event details
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    action_taken: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)  # blocked, allowed, flagged, etc.
+
+    # Threat analysis
+    threat_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)  # 0.0-1.0
+    threat_indicators: Mapped[Dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    failed_attempts_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Resolution tracking
+    resolved: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    resolution_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Alert tracking
+    alert_sent: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    alert_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    alert_recipients: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
+
+    # Additional context
+    context: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("idx_security_type_time", "event_type", "timestamp"),
+        Index("idx_security_severity_time", "severity", "timestamp"),
+        Index("idx_security_user_time", "user_id", "timestamp"),
+        Index("idx_security_ip_time", "client_ip", "timestamp"),
+        Index("idx_security_unresolved", "resolved", "severity", "timestamp"),
+    )
+
+
+class AuditTrail(Base):
+    """Comprehensive audit trail for data access and changes.
+
+    Tracks all significant system changes and data access for
+    compliance and security auditing.
+    """
+
+    __tablename__ = "audit_trails"
+
+    # Primary key
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: uuid.uuid4().hex)
+
+    # Timestamps
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True, default=utc_now)
+
+    # Correlation tracking
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    request_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+
+    # Action details
+    action: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # create, read, update, delete, execute, etc.
+    resource_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)  # tool, resource, prompt, user, etc.
+    resource_id: Mapped[Optional[str]] = mapped_column(String(255), index=True, nullable=True)
+    resource_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    # User context
+    user_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    user_email: Mapped[Optional[str]] = mapped_column(String(255), index=True, nullable=True)
+    team_id: Mapped[Optional[str]] = mapped_column(String(36), index=True, nullable=True)
+
+    # Request context
+    client_ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    request_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    request_method: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+
+    # Change tracking
+    old_values: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    new_values: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    changes: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+
+    # Data classification
+    data_classification: Mapped[Optional[str]] = mapped_column(String(50), index=True, nullable=True)  # public, internal, confidential, restricted
+    requires_review: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
+
+    # Result
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False, index=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Additional context
+    context: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("idx_audit_action_time", "action", "timestamp"),
+        Index("idx_audit_resource_time", "resource_type", "resource_id", "timestamp"),
+        Index("idx_audit_user_time", "user_id", "timestamp"),
+        Index("idx_audit_classification", "data_classification", "timestamp"),
+        Index("idx_audit_review", "requires_review", "timestamp"),
+    )
 
 
 if __name__ == "__main__":
