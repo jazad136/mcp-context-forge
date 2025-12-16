@@ -154,7 +154,15 @@ class Settings(BaseSettings):
     port: PositiveInt = Field(default=4444, ge=1, le=65535)
     client_mode: bool = False
     docs_allow_basic_auth: bool = False  # Allow basic auth for docs
-    database_url: str = "sqlite:///./mcp.db"
+    database_url: str = Field(
+        default="sqlite:///./mcp.db",
+        description=(
+            "Database connection URL. Supports SQLite, PostgreSQL, MySQL/MariaDB. "
+            "For PostgreSQL with custom schema, use the 'options' query parameter: "
+            "postgresql://user:pass@host:5432/db?options=-c%20search_path=schema_name "
+            "(See Issue #1535 for details)"
+        ),
+    )
 
     # Absolute paths resolved at import-time (still override-able via env vars)
     templates_dir: Path = Field(default_factory=lambda: Path(str(files("mcpgateway") / "templates")))
@@ -446,6 +454,12 @@ class Settings(BaseSettings):
     llmchat_session_lock_wait: float = Field(default=0.2, description="Seconds between polls")
     llmchat_chat_history_ttl: int = Field(default=3600, description="Seconds for chat history expiry")
     llmchat_chat_history_max_messages: int = Field(default=50, description="Maximum message history to store per user")
+
+    # LLM Settings (Internal API for LLM Chat)
+    llm_api_prefix: str = Field(default="/v1", description="API prefix for internal LLM endpoints")
+    llm_request_timeout: int = Field(default=120, description="Request timeout in seconds for LLM API calls")
+    llm_streaming_enabled: bool = Field(default=True, description="Enable streaming responses for LLM Chat")
+    llm_health_check_interval: int = Field(default=300, description="Provider health check interval in seconds")
 
     @field_validator("allowed_roots", mode="before")
     @classmethod
