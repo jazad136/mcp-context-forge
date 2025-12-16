@@ -87,6 +87,7 @@ class TestGrpcEndpoint:
         }
 
     @patch("mcpgateway.translate_grpc.grpc")
+    @pytest.mark.asyncio
     async def test_start_insecure_channel(self, mock_grpc, endpoint):
         """Test starting endpoint with insecure channel."""
         mock_channel = MagicMock()
@@ -100,6 +101,7 @@ class TestGrpcEndpoint:
 
     @patch("mcpgateway.translate_grpc.grpc")
     @patch("builtins.open", create=True)
+    @pytest.mark.asyncio
     async def test_start_secure_channel_with_certs(self, mock_open, mock_grpc, endpoint_with_tls):
         """Test starting endpoint with TLS certificates."""
         mock_channel = MagicMock()
@@ -118,6 +120,7 @@ class TestGrpcEndpoint:
         mock_grpc.secure_channel.assert_called_once()
 
     @patch("mcpgateway.translate_grpc.grpc")
+    @pytest.mark.asyncio
     async def test_start_secure_channel_without_certs(self, mock_grpc):
         """Test starting endpoint with TLS but no cert files."""
         endpoint = GrpcEndpoint(
@@ -139,6 +142,7 @@ class TestGrpcEndpoint:
     @patch("mcpgateway.translate_grpc.grpc")
     @patch("mcpgateway.translate_grpc.reflection_pb2_grpc")
     @patch("mcpgateway.translate_grpc.reflection_pb2")
+    @pytest.mark.asyncio
     async def test_discover_services_success(
         self, mock_reflection_pb2, mock_reflection_grpc, mock_grpc, endpoint
     ):
@@ -179,6 +183,7 @@ class TestGrpcEndpoint:
 
     @patch("mcpgateway.translate_grpc.grpc")
     @patch("mcpgateway.translate_grpc.reflection_pb2_grpc")
+    @pytest.mark.asyncio
     async def test_discover_services_skip_reflection_service(
         self, mock_reflection_grpc, mock_grpc, endpoint
     ):
@@ -223,6 +228,7 @@ class TestGrpcEndpoint:
 
     @patch("mcpgateway.translate_grpc.grpc")
     @patch("mcpgateway.translate_grpc.reflection_pb2_grpc")
+    @pytest.mark.asyncio
     async def test_discover_services_error(self, mock_reflection_grpc, mock_grpc, endpoint):
         """Test service discovery error handling."""
         mock_channel = MagicMock()
@@ -237,6 +243,7 @@ class TestGrpcEndpoint:
 
         assert "Connection failed" in str(exc_info.value)
 
+    @pytest.mark.asyncio
     async def test_invoke_service_not_found(self, endpoint):
         """Test invoke with non-existent service."""
         with pytest.raises(ValueError, match="Service .* not found"):
@@ -246,6 +253,7 @@ class TestGrpcEndpoint:
                 request_data={"param": "value"},
             )
 
+    @pytest.mark.asyncio
     async def test_invoke_streaming_service_not_found(self, endpoint):
         """Test invoke_streaming with non-existent service."""
         with pytest.raises(ValueError, match="Service .* not found"):
@@ -256,6 +264,7 @@ class TestGrpcEndpoint:
             ):
                 pass
 
+    @pytest.mark.asyncio
     async def test_close(self, endpoint):
         """Test closing the gRPC channel."""
         mock_channel = MagicMock()
@@ -265,10 +274,12 @@ class TestGrpcEndpoint:
 
         mock_channel.close.assert_called_once()
 
+    @pytest.mark.asyncio
     async def test_close_no_channel(self, endpoint):
         """Test closing when no channel exists."""
         # Should not raise an error
         await endpoint.close()
+
 
     def test_get_services(self, endpoint):
         """Test getting list of discovered services."""
@@ -371,6 +382,7 @@ class TestExposeGrpcViaSse:
 
     @patch("mcpgateway.translate_grpc.GrpcEndpoint")
     @patch("mcpgateway.translate_grpc.asyncio.sleep")
+    @pytest.mark.asyncio
     async def test_expose_grpc_via_sse_basic(self, mock_sleep, mock_endpoint_class):
         """Test basic gRPC exposure via SSE."""
         # Mock the endpoint
@@ -393,6 +405,7 @@ class TestExposeGrpcViaSse:
 
     @patch("mcpgateway.translate_grpc.GrpcEndpoint")
     @patch("mcpgateway.translate_grpc.asyncio.sleep")
+    @pytest.mark.asyncio
     async def test_expose_grpc_via_sse_with_tls(self, mock_sleep, mock_endpoint_class):
         """Test gRPC exposure with TLS configuration."""
         mock_endpoint = MagicMock()
@@ -426,6 +439,7 @@ class TestExposeGrpcViaSse:
 
     @patch("mcpgateway.translate_grpc.GrpcEndpoint")
     @patch("mcpgateway.translate_grpc.asyncio.sleep")
+    @pytest.mark.asyncio
     async def test_expose_grpc_via_sse_with_metadata(self, mock_sleep, mock_endpoint_class):
         """Test gRPC exposure with metadata headers."""
         mock_endpoint = MagicMock()
