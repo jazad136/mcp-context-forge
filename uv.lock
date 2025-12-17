@@ -2915,7 +2915,11 @@ dev = [
     { name = "importchecker", specifier = ">=3.0" },
     { name = "interrogate", specifier = ">=1.7.0" },
     { name = "isort", specifier = ">=6.1.0" },
+<<<<<<< HEAD
     { name = "locust", specifier = ">=2.35.0" },
+=======
+    { name = "mcp-contextforge-gateway", extras = ["playwright"], editable = "." },
+>>>>>>> 5de16fdf1e5d34256dd444ce0159483ddb9d9a2b
     { name = "mypy", specifier = ">=1.18.2" },
     { name = "pexpect", specifier = ">=4.9.0" },
     { name = "pip-audit", specifier = ">=2.9.0" },

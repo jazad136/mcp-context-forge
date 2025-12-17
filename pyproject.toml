@@ -714,3 +714,11 @@ quiet = false
 whitelist-regex = []
 color = true
 omit-covered-files = false
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+mcp-contextforge-gateway = { workspace = true }
